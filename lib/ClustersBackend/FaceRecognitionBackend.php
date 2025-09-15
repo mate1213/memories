@@ -53,8 +53,7 @@ class FaceRecognitionBackend extends Backend
 
     public function isEnabled(): bool
     {
-        return Util::facerecognitionIsInstalled()
-               && Util::facerecognitionIsEnabled();
+        return Util::facerecognitionIsEnabled();
     }
 
     public function transformDayQuery(IQueryBuilder &$query, bool $aggregate): void
@@ -70,12 +69,12 @@ class FaceRecognitionBackend extends Backend
 
         // Join with images
         $query->innerJoin('m', 'facerecog_images', 'fri', $query->expr()->andX(
-            $query->expr()->eq('fri.file', 'm.fileid'),
+            $query->expr()->eq('fri.nc_file_id', 'm.fileid'),
             $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
         ));
 
         // Join with faces
-        $query->innerJoin('fri', 'facerecog_faces', 'frf', $query->expr()->eq('frf.image', 'fri.id'));
+        $query->innerJoin('fri', 'facerecog_faces', 'frf', $query->expr()->eq('frf.image_id', 'fri.id'));
 
         // Join with persons
         $nameField = is_numeric($personName) ? 'frp.id' : 'frp.name';
@@ -149,7 +148,7 @@ class FaceRecognitionBackend extends Backend
         $query->select(
             'frf.id as faceid',         // Face ID
             'frp.id as cluster_id',     // Cluster ID
-            'fri.file as file_id',      // Get actual file
+            'fri.nc_file_id as file_id',      // Get actual file
             'frf.x',                    // Image cropping
             'frf.y',
             'frf.width',
@@ -167,7 +166,7 @@ class FaceRecognitionBackend extends Backend
         ));
 
         // WHERE these photos are memories indexed
-        $query->innerJoin('fri', 'memories', 'm', $query->expr()->eq('m.fileid', 'fri.file'));
+        $query->innerJoin('fri', 'memories', 'm', $query->expr()->eq('m.fileid', 'fri.nc_file_id'));
 
         $query->innerJoin('frf', 'facerecog_persons', 'frp', $query->expr()->eq('frp.id', 'frf.person'));
 
@@ -187,7 +186,7 @@ class FaceRecognitionBackend extends Backend
 
         // Filter by fileid if specified
         if (null !== $fileid) {
-            $query->andWhere($query->expr()->eq('fri.file', $query->createNamedParameter($fileid, \PDO::PARAM_INT)));
+            $query->andWhere($query->expr()->eq('fri.nc_file_id', $query->createNamedParameter($fileid, \PDO::PARAM_INT)));
         }
 
         // Sort by date taken so we get recent photos
@@ -247,19 +246,28 @@ class FaceRecognitionBackend extends Backend
 
         // SELECT all face clusters
         $count = $query->func()->count(SQL::distinct($query, 'm.fileid'));
-        $query->select('frp.id')->from('facerecog_persons', 'frp');
+        $query->select('frc.id')->from('facerecog_clusters', 'frc');
         $query->selectAlias($count, 'count');
-        $query->selectAlias('frp.user', 'user_id');
+        $query->selectAlias('frc.user', 'user_id');
+
+        // WHERE there are clusters with person
+        $query->innerJoin('frc', 'facerecog_person_clusters', 'frcp', $query->expr()->eq('frcp.cluster_id', 'frc.id'));
+
+        // WHERE there are clusters with person
+        $query->innerJoin('frc', 'facerecog_persons', 'frp', $query->expr()->eq('frp.id', 'frcp.person_id'));
 
         // WHERE there are faces with this cluster
-        $query->innerJoin('frp', 'facerecog_faces', 'frf', $query->expr()->eq('frp.id', 'frf.person'));
+        $query->innerJoin('frc', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.cluster_id', 'frc.id'));
+
+        // WHERE there are faces with this cluster
+        $query->innerJoin('frc', 'facerecog_faces', 'frf', $query->expr()->eq('frc.id', 'frcf.face_id'));
 
         // WHERE faces are from images.
-        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image'));
+        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image_id'));
 
         // WHERE these items are memories indexed photos
         $query->innerJoin('fri', 'memories', 'm', $query->expr()->andX(
-            $query->expr()->eq('fri.file', 'm.fileid'),
+            $query->expr()->eq('fri.nc_file_id', 'm.fileid'),
             $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
         ));
 
@@ -267,41 +275,41 @@ class FaceRecognitionBackend extends Backend
         $query = $this->tq->filterFilecache($query);
 
         // GROUP by ID of face cluster
-        $query->addGroupBy('frp.id', 'frp.user');
+        $query->addGroupBy('frc.id', 'frc.user');
         $query->andWhere($query->expr()->isNull('frp.name'));
 
         // The query change if we want the people in an fileid, or the unnamed clusters
         if ($fileid > 0) {
             // WHERE these clusters contain fileid if specified
-            $query->andWhere($query->expr()->eq('fri.file', $query->createNamedParameter($fileid)));
+            $query->andWhere($query->expr()->eq('fri.nc_file_id', $query->createNamedParameter($fileid)));
         } else {
             // WHERE these clusters has a minimum number of faces
             $query->having($query->expr()->gte($count, $query->expr()->literal($this->minFaceInClusters(), \PDO::PARAM_INT)));
             // WHERE these clusters were not hidden due inconsistencies
-            $query->andWhere($query->expr()->eq('frp.is_visible', $query->expr()->literal(1)));
+            $query->andWhere($query->expr()->eq('frc.is_visible', $query->expr()->literal(1)));
         }
 
         // ORDER by number of faces in cluster and id for response stability.
         $query->addOrderBy('count', 'DESC');
-        $query->addOrderBy('frp.id', 'DESC');
+        $query->addOrderBy('frc.id', 'DESC');
 
         // It is not worth displaying all unnamed clusters. We show 15 to name them progressively,
         $query->setMaxResults(15);
 
         // SELECT covers
-        $query = SQL::materialize($query, 'frp');
+        $query = SQL::materialize($query, 'frc');
         Covers::selectCover(
             query: $query,
             type: self::clusterType(),
-            clusterTable: 'frp',
+            clusterTable: 'frc',
             clusterTableId: 'id',
-            objectTable: 'facerecog_faces',
-            objectTableObjectId: 'id',
-            objectTableClusterId: 'person',
+            objectTable: 'facerecog_cluster_faces',
+            objectTableObjectId: 'face_id',
+            objectTableClusterId: 'cluster_id',
         );
 
         // SELECT etag for the cover
-        $query = SQL::materialize($query, 'frp');
+        $query = SQL::materialize($query, 'frc');
         $this->tq->selectEtag($query, 'cover', 'cover_etag');
 
         // FETCH all faces
@@ -315,20 +323,28 @@ class FaceRecognitionBackend extends Backend
         // SELECT all face clusters
         $query->select('frp.name')
             ->selectAlias($query->func()->count(SQL::distinct($query, 'm.fileid')), 'count')
-            ->selectAlias($query->func()->min('frp.id'), 'id')
-            ->selectAlias('frp.user', 'user_id')
-            ->from('facerecog_persons', 'frp')
+            ->selectAlias($query->func()->min('frc.id'), 'id')
+            ->selectAlias('frc.user', 'user_id')
+            ->from('facerecog_clusters', 'frc')
         ;
+        // WHERE there are clusters with person
+        $query->innerJoin('frc', 'facerecog_person_clusters', 'frcp', $query->expr()->eq('frcp.cluster_id', 'frc.id'));
+
+        // WHERE there are clusters with person
+        $query->innerJoin('frc', 'facerecog_persons', 'frp', $query->expr()->eq('frp.id', 'frcp.person_id'));
 
         // WHERE there are faces with this cluster
-        $query->innerJoin('frp', 'facerecog_faces', 'frf', $query->expr()->eq('frp.id', 'frf.person'));
+        $query->innerJoin('frc', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.cluster_id', 'frc.id'));
+
+        // WHERE there are faces with this cluster
+        $query->innerJoin('frc', 'facerecog_faces', 'frf', $query->expr()->eq('frc.id', 'frcf.face_id'));
 
         // WHERE faces are from images.
-        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image'));
+        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image_id'));
 
         // WHERE these items are memories indexed photos
         $query->innerJoin('fri', 'memories', 'm', $query->expr()->andX(
-            $query->expr()->eq('fri.file', 'm.fileid'),
+            $query->expr()->eq('fri.nc_file_id', 'm.fileid'),
             $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
         ));
 
@@ -340,30 +356,30 @@ class FaceRecognitionBackend extends Backend
 
         // WHERE these clusters contain fileid if specified
         if ($fileid > 0) {
-            $query->andWhere($query->expr()->eq('fri.file', $query->createNamedParameter($fileid)));
+            $query->andWhere($query->expr()->eq('fri.nc_file_id', $query->createNamedParameter($fileid)));
         }
 
-        $query->addGroupBy('frp.name', 'frp.user');
+        $query->addGroupBy('frp.name', 'frc.user');
 
         // ORDER by number of faces in cluster
         $query->addOrderBy('count', 'DESC');
         $query->addOrderBy('frp.name', 'ASC');
 
         // SELECT to get all covers
-        $query = SQL::materialize($query, 'frp');
+        $query = SQL::materialize($query, 'frc');
         Covers::selectCover(
             query: $query,
             type: self::clusterType(),
-            clusterTable: 'frp',
+            clusterTable: 'frc',
             clusterTableId: 'id',
-            objectTable: 'facerecog_faces',
-            objectTableObjectId: 'id',
-            objectTableClusterId: 'person',
+            objectTable: 'facerecog_cluster_faces',
+            objectTableObjectId: 'face_id',
+            objectTableClusterId: 'cluster_id',
         );
 
         // SELECT etag for the cover
-        $query = SQL::materialize($query, 'frp');
-        $this->tq->selectEtag($query, 'frp.cover', 'cover_etag');
+        $query = SQL::materialize($query, 'frc');
+        $this->tq->selectEtag($query, 'frc.cover', 'cover_etag');
 
         // FETCH all faces
         return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
