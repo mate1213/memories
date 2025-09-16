@@ -34,7 +34,8 @@ use OCP\IRequest;
 class FaceRecognitionBackend extends Backend
 {
     use PeopleBackendUtils;
-    private $isVersion10 = false;
+
+    private bool $isVersion10 = false;
 
     public function __construct(
         protected IRequest $request,
