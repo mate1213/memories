@@ -131,7 +131,11 @@ class Util
         }
 
         try {
-            return 'true' === \OC::$server->get(IConfig::class)
+            $default = \OC::$server->get(IAppConfig::class)
+                ->getValueBool('facerecognition', 'default_enabled', false)
+            ;
+
+            return $default || 'true' === \OC::$server->get(IConfig::class)
                 ->getUserValue(self::getUID(), 'facerecognition', 'enabled', 'false')
             ;
         } catch (\Exception) {
