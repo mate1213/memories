@@ -34,12 +34,17 @@ use OCP\IRequest;
 class FaceRecognitionBackend extends Backend
 {
     use PeopleBackendUtils;
+    private $isVersion10 = false;
 
     public function __construct(
         protected IRequest $request,
         protected TimelineQuery $tq,
         protected IAppConfig $appConfig,
-    ) {}
+    ) {
+        $appManager = \OC::$server->get(\OCP\App\IAppManager::class);
+        $v = $appManager->getAppVersion('facerecognition');
+        $this->isVersion10 = version_compare($v, '0.10.0', '>=');
+    }
 
     public static function appName(): string
     {
@@ -58,53 +63,10 @@ class FaceRecognitionBackend extends Backend
 
     public function transformDayQuery(IQueryBuilder &$query, bool $aggregate): void
     {
-        $personStr = (string) $this->request->getParam('facerecognition');
-
-        // Get title and uid of face user
-        $personNames = explode('/', $personStr);
-        if (2 !== \count($personNames)) {
-            throw new \Exception('Invalid person query');
-        }
-        [$personUid, $personName] = $personNames;
-
-        // Join with images
-        $query->innerJoin('m', 'facerecog_images', 'fri', $query->expr()->andX(
-            $query->expr()->eq('fri.nc_file_id', 'm.fileid'),
-            $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
-        ));
-
-        // Join with faces
-        $query->innerJoin('fri', 'facerecog_faces', 'frf', $query->expr()->eq('frf.image_id', 'fri.id'));
-        // WHERE there are faces with this cluster
-        $query->innerJoin('frf', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.face_id', 'frf.id'));
-
-        // WHERE there are clusters with person
-        $query->innerJoin('frcf', 'facerecog_person_clusters', 'frcp', $query->expr()->eq('frcp.cluster_id', 'frcf.cluster_id'));
-
-        $query->innerJoin('frcp', 'facerecog_clusters', 'frc', $query->expr()->eq('frc.id', 'frcp.cluster_id'));
-
-        // Join with persons
-        $nameField = is_numeric($personName) ? 'frp.id' : 'frp.name';
-        $query->innerJoin('frcp', 'facerecog_persons', 'frp', $query->expr()->andX(
-            $query->expr()->eq('frcp.person_id', 'frp.id'),
-            $query->expr()->eq('frc.user', $query->createNamedParameter($personUid)),
-            $query->expr()->eq($nameField, $query->createNamedParameter($personName)),
-        ));
-
-        if (!$aggregate) {
-            // Multiple detections for the same image
-            $query->selectAlias('frf.id', 'faceid');
-
-            // Face Rect
-            if ($this->request->getParam('facerect')) {
-                $query->selectAlias('frf.x', 'face_x')
-                    ->selectAlias('frf.y', 'face_y')
-                    ->selectAlias('frf.width', 'face_width')
-                    ->selectAlias('frf.height', 'face_height')
-                    ->selectAlias('m.w', 'image_width')
-                    ->selectAlias('m.h', 'image_height')
-                ;
-            }
+        if ($this->isVersion10) {
+            $this->transformDayQuery_V10($query, $aggregate);
+        } else {
+            $this->transformDayQuery_V9($query, $aggregate);
         }
     }
 
@@ -148,6 +110,48 @@ class FaceRecognitionBackend extends Backend
     }
 
     public function getPhotos(string $name, ?int $limit = null, ?int $fileid = null): array
+    {
+        if ($this->isVersion10) {
+            return $this->getPhotos_V10($name, $limit, $fileid);
+        }
+
+        return $this->getPhotos_V9($name, $limit, $fileid);
+    }
+
+    public function sortPhotosForPreview(array &$photos): void
+    {
+        // Convert to recognize format (percentage position-size)
+        foreach ($photos as &$p) {
+            $p['x'] = (float) $p['x'] / (float) $p['image_width'];
+            $p['y'] = (float) $p['y'] / (float) $p['image_height'];
+            $p['width'] = (float) $p['width'] / (float) $p['image_width'];
+            $p['height'] = (float) $p['height'] / (float) $p['image_height'];
+        }
+
+        $this->sortByScores($photos);
+    }
+
+    public function getPreviewBlob(ISimpleFile $file, array $photo): array
+    {
+        return $this->cropFace($file, $photo, 1.8);
+    }
+
+    public function getPreviewQuality(): int
+    {
+        return 2048;
+    }
+
+    public function getCoverObjId(array $photo): int
+    {
+        return (int) $photo['faceid'];
+    }
+
+    public function getClusterIdFrom(array $photo): int
+    {
+        return (int) $photo['cluster_id'];
+    }
+
+    public function getPhotos_V10(string $name, ?int $limit = null, ?int $fileid = null): array
     {
         $query = $this->tq->getBuilder();
 
@@ -210,50 +214,189 @@ class FaceRecognitionBackend extends Backend
         return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
     }
 
-    public function sortPhotosForPreview(array &$photos): void
+    public function getPhotos_V9(string $name, ?int $limit = null, ?int $fileid = null): array
     {
-        // Convert to recognize format (percentage position-size)
-        foreach ($photos as &$p) {
-            $p['x'] = (float) $p['x'] / (float) $p['image_width'];
-            $p['y'] = (float) $p['y'] / (float) $p['image_height'];
-            $p['width'] = (float) $p['width'] / (float) $p['image_width'];
-            $p['height'] = (float) $p['height'] / (float) $p['image_height'];
+        $query = $this->tq->getBuilder();
+
+        // SELECT face detections
+        $query->select(
+            'frf.id as faceid',         // Face ID
+            'frp.id as cluster_id',     // Cluster ID
+            'fri.file as file_id',      // Get actual file
+            'frf.x',                    // Image cropping
+            'frf.y',
+            'frf.width',
+            'frf.height',
+            'm.w as image_width',       // Scoring
+            'm.h as image_height',
+            'm.fileid',
+            'm.datetaken',              // Just in case, for postgres
+        )->from('facerecog_faces', 'frf');
+
+        // WHERE faces are from images and current model.
+        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->andX(
+            $query->expr()->eq('fri.id', 'frf.image'),
+            $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
+        ));
+
+        // WHERE these photos are memories indexed
+        $query->innerJoin('fri', 'memories', 'm', $query->expr()->eq('m.fileid', 'fri.file'));
+
+        $query->innerJoin('frf', 'facerecog_persons', 'frp', $query->expr()->eq('frp.id', 'frf.person'));
+
+        // WHERE faces are from id persons (or a cluster).
+        $nameField = is_numeric($name) ? 'frp.id' : 'frp.name';
+        $query->where($query->expr()->eq($nameField, $query->createNamedParameter($name)));
+
+        // WHERE these photos are in the user's requested folder recursively
+        $query = $this->tq->filterFilecache($query);
+
+        // LIMIT results
+        if (-6 === $limit) {
+            Covers::filterCover($query, self::clusterType(), 'frf', 'id', 'person');
+        } elseif (null !== $limit) {
+            $query->setMaxResults($limit);
         }
 
-        $this->sortByScores($photos);
-    }
+        // Filter by fileid if specified
+        if (null !== $fileid) {
+            $query->andWhere($query->expr()->eq('fri.file', $query->createNamedParameter($fileid, \PDO::PARAM_INT)));
+        }
 
-    public function getPreviewBlob(ISimpleFile $file, array $photo): array
-    {
-        return $this->cropFace($file, $photo, 1.8);
-    }
+        // Sort by date taken so we get recent photos
+        $query->addOrderBy('m.datetaken', 'DESC');
+        $query->addOrderBy('m.fileid', 'DESC'); // tie-breaker
 
-    public function getPreviewQuality(): int
-    {
-        return 2048;
-    }
-
-    public function getCoverObjId(array $photo): int
-    {
-        return (int) $photo['faceid'];
-    }
-
-    public function getClusterIdFrom(array $photo): int
-    {
-        return (int) $photo['cluster_id'];
+        // FETCH face detections
+        return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
     }
 
     private function model(): int
     {
-        return (int) $this->appConfig->getValueString('facerecognition', 'model', (string) -1);
+        return $this->appConfig->getValueInt('facerecognition', 'model', -1);
     }
 
     private function minFaceInClusters(): int
     {
-        return (int) $this->appConfig->getValueString('facerecognition', 'min_faces_in_cluster', (string) 5);
+        return $this->appConfig->getValueInt('facerecognition', 'min_faces_in_cluster', 5);
     }
 
     private function getFaceRecognitionClusters(int $fileid = 0): array
+    {
+        if ($this->isVersion10) {
+            return $this->getFaceRecognitionClusters_V10($fileid);
+        }
+
+        return $this->getFaceRecognitionClusters_V9($fileid);
+    }
+
+    private function getFaceRecognitionPersons(int $fileid = 0): array
+    {
+        if ($this->isVersion10) {
+            return $this->getFaceRecognitionPersons_V10($fileid);
+        }
+
+        return $this->getFaceRecognitionPersons_V9($fileid);
+    }
+
+    private function transformDayQuery_V10(IQueryBuilder &$query, bool $aggregate): void
+    {
+        $personStr = (string) $this->request->getParam('facerecognition');
+
+        // Get title and uid of face user
+        $personNames = explode('/', $personStr);
+        if (2 !== \count($personNames)) {
+            throw new \Exception('Invalid person query');
+        }
+        [$personUid, $personName] = $personNames;
+
+        // Join with images
+        $query->innerJoin('m', 'facerecog_images', 'fri', $query->expr()->andX(
+            $query->expr()->eq('fri.nc_file_id', 'm.fileid'),
+            $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
+        ));
+
+        // Join with faces
+        $query->innerJoin('fri', 'facerecog_faces', 'frf', $query->expr()->eq('frf.image_id', 'fri.id'));
+        // WHERE there are faces with this cluster
+        $query->innerJoin('frf', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.face_id', 'frf.id'));
+
+        // WHERE there are clusters with person
+        $query->innerJoin('frcf', 'facerecog_person_clusters', 'frcp', $query->expr()->eq('frcp.cluster_id', 'frcf.cluster_id'));
+
+        $query->innerJoin('frcp', 'facerecog_clusters', 'frc', $query->expr()->eq('frc.id', 'frcp.cluster_id'));
+
+        // Join with persons
+        $nameField = is_numeric($personName) ? 'frp.id' : 'frp.name';
+        $query->innerJoin('frcp', 'facerecog_persons', 'frp', $query->expr()->andX(
+            $query->expr()->eq('frcp.person_id', 'frp.id'),
+            $query->expr()->eq('frc.user', $query->createNamedParameter($personUid)),
+            $query->expr()->eq($nameField, $query->createNamedParameter($personName)),
+        ));
+
+        if (!$aggregate) {
+            // Multiple detections for the same image
+            $query->selectAlias('frf.id', 'faceid');
+
+            // Face Rect
+            if ($this->request->getParam('facerect')) {
+                $query->selectAlias('frf.x', 'face_x')
+                    ->selectAlias('frf.y', 'face_y')
+                    ->selectAlias('frf.width', 'face_width')
+                    ->selectAlias('frf.height', 'face_height')
+                    ->selectAlias('m.w', 'image_width')
+                    ->selectAlias('m.h', 'image_height')
+                ;
+            }
+        }
+    }
+
+    private function transformDayQuery_V9(IQueryBuilder &$query, bool $aggregate): void
+    {
+        $personStr = (string) $this->request->getParam('facerecognition');
+
+        // Get title and uid of face user
+        $personNames = explode('/', $personStr);
+        if (2 !== \count($personNames)) {
+            throw new \Exception('Invalid person query');
+        }
+        [$personUid, $personName] = $personNames;
+
+        // Join with images
+        $query->innerJoin('m', 'facerecog_images', 'fri', $query->expr()->andX(
+            $query->expr()->eq('fri.file', 'm.fileid'),
+            $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
+        ));
+
+        // Join with faces
+        $query->innerJoin('fri', 'facerecog_faces', 'frf', $query->expr()->eq('frf.image', 'fri.id'));
+
+        // Join with persons
+        $nameField = is_numeric($personName) ? 'frp.id' : 'frp.name';
+        $query->innerJoin('frf', 'facerecog_persons', 'frp', $query->expr()->andX(
+            $query->expr()->eq('frf.person', 'frp.id'),
+            $query->expr()->eq('frp.user', $query->createNamedParameter($personUid)),
+            $query->expr()->eq($nameField, $query->createNamedParameter($personName)),
+        ));
+
+        if (!$aggregate) {
+            // Multiple detections for the same image
+            $query->selectAlias('frf.id', 'faceid');
+
+            // Face Rect
+            if ($this->request->getParam('facerect')) {
+                $query->selectAlias('frf.x', 'face_x')
+                    ->selectAlias('frf.y', 'face_y')
+                    ->selectAlias('frf.width', 'face_width')
+                    ->selectAlias('frf.height', 'face_height')
+                    ->selectAlias('m.w', 'image_width')
+                    ->selectAlias('m.h', 'image_height')
+                ;
+            }
+        }
+    }
+
+    private function getFaceRecognitionClusters_V10(int $fileid = 0): array
     {
         $query = $this->tq->getBuilder();
 
@@ -329,7 +472,74 @@ class FaceRecognitionBackend extends Backend
         return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
     }
 
-    private function getFaceRecognitionPersons(int $fileid = 0): array
+    private function getFaceRecognitionClusters_V9(int $fileid = 0): array
+    {
+        $query = $this->tq->getBuilder();
+
+        // SELECT all face clusters
+        $count = $query->func()->count(SQL::distinct($query, 'm.fileid'));
+        $query->select('frp.id')->from('facerecog_persons', 'frp');
+        $query->selectAlias($count, 'count');
+        $query->selectAlias('frp.user', 'user_id');
+
+        // WHERE there are faces with this cluster
+        $query->innerJoin('frp', 'facerecog_faces', 'frf', $query->expr()->eq('frp.id', 'frf.person'));
+
+        // WHERE faces are from images.
+        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image'));
+
+        // WHERE these items are memories indexed photos
+        $query->innerJoin('fri', 'memories', 'm', $query->expr()->andX(
+            $query->expr()->eq('fri.file', 'm.fileid'),
+            $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
+        ));
+
+        // WHERE these photos are in the user's requested folder recursively
+        $query = $this->tq->filterFilecache($query);
+
+        // GROUP by ID of face cluster
+        $query->addGroupBy('frp.id', 'frp.user');
+        $query->andWhere($query->expr()->isNull('frp.name'));
+
+        // The query change if we want the people in an fileid, or the unnamed clusters
+        if ($fileid > 0) {
+            // WHERE these clusters contain fileid if specified
+            $query->andWhere($query->expr()->eq('fri.file', $query->createNamedParameter($fileid)));
+        } else {
+            // WHERE these clusters has a minimum number of faces
+            $query->having($query->expr()->gte($count, $query->expr()->literal($this->minFaceInClusters(), \PDO::PARAM_INT)));
+            // WHERE these clusters were not hidden due inconsistencies
+            $query->andWhere($query->expr()->eq('frp.is_visible', $query->expr()->literal(1)));
+        }
+
+        // ORDER by number of faces in cluster and id for response stability.
+        $query->addOrderBy('count', 'DESC');
+        $query->addOrderBy('frp.id', 'DESC');
+
+        // It is not worth displaying all unnamed clusters. We show 15 to name them progressively,
+        $query->setMaxResults(15);
+
+        // SELECT covers
+        $query = SQL::materialize($query, 'frp');
+        Covers::selectCover(
+            query: $query,
+            type: self::clusterType(),
+            clusterTable: 'frp',
+            clusterTableId: 'id',
+            objectTable: 'facerecog_faces',
+            objectTableObjectId: 'id',
+            objectTableClusterId: 'person',
+        );
+
+        // SELECT etag for the cover
+        $query = SQL::materialize($query, 'frp');
+        $this->tq->selectEtag($query, 'cover', 'cover_etag');
+
+        // FETCH all faces
+        return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
+    }
+
+    private function getFaceRecognitionPersons_V10(int $fileid = 0): array
     {
         $query = $this->tq->getBuilder();
 
@@ -393,6 +603,67 @@ class FaceRecognitionBackend extends Backend
         // SELECT etag for the cover
         $query = SQL::materialize($query, 'frc');
         $this->tq->selectEtag($query, 'frc.cover', 'cover_etag');
+
+        // FETCH all faces
+        return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
+    }
+
+    private function getFaceRecognitionPersons_V9(int $fileid = 0): array
+    {
+        $query = $this->tq->getBuilder();
+
+        // SELECT all face clusters
+        $query->select('frp.name')
+            ->selectAlias($query->func()->count(SQL::distinct($query, 'm.fileid')), 'count')
+            ->selectAlias($query->func()->min('frp.id'), 'id')
+            ->selectAlias('frp.user', 'user_id')
+            ->from('facerecog_persons', 'frp')
+        ;
+
+        // WHERE there are faces with this cluster
+        $query->innerJoin('frp', 'facerecog_faces', 'frf', $query->expr()->eq('frp.id', 'frf.person'));
+
+        // WHERE faces are from images.
+        $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image'));
+
+        // WHERE these items are memories indexed photos
+        $query->innerJoin('fri', 'memories', 'm', $query->expr()->andX(
+            $query->expr()->eq('fri.file', 'm.fileid'),
+            $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
+        ));
+
+        // WHERE these photos are in the user's requested folder recursively
+        $query = $this->tq->filterFilecache($query);
+
+        // GROUP by name of face clusters
+        $query->andWhere($query->expr()->isNotNull('frp.name'));
+
+        // WHERE these clusters contain fileid if specified
+        if ($fileid > 0) {
+            $query->andWhere($query->expr()->eq('fri.file', $query->createNamedParameter($fileid)));
+        }
+
+        $query->addGroupBy('frp.name', 'frp.user');
+
+        // ORDER by number of faces in cluster
+        $query->addOrderBy('count', 'DESC');
+        $query->addOrderBy('frp.name', 'ASC');
+
+        // SELECT to get all covers
+        $query = SQL::materialize($query, 'frp');
+        Covers::selectCover(
+            query: $query,
+            type: self::clusterType(),
+            clusterTable: 'frp',
+            clusterTableId: 'id',
+            objectTable: 'facerecog_faces',
+            objectTableObjectId: 'id',
+            objectTableClusterId: 'person',
+        );
+
+        // SELECT etag for the cover
+        $query = SQL::materialize($query, 'frp');
+        $this->tq->selectEtag($query, 'frp.cover', 'cover_etag');
 
         // FETCH all faces
         return $this->tq->executeQueryWithCTEs($query)->fetchAll() ?: [];
