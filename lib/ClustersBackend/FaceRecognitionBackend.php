@@ -75,12 +75,19 @@ class FaceRecognitionBackend extends Backend
 
         // Join with faces
         $query->innerJoin('fri', 'facerecog_faces', 'frf', $query->expr()->eq('frf.image_id', 'fri.id'));
+        // WHERE there are faces with this cluster
+        $query->innerJoin('frf', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.face_id', 'frf.id'));
+
+        // WHERE there are clusters with person
+        $query->innerJoin('frcf', 'facerecog_person_clusters', 'frcp', $query->expr()->eq('frcp.cluster_id', 'frcf.cluster_id'));
+
+        $query->innerJoin('frcp', 'facerecog_clusters', 'frc', $query->expr()->eq('frc.id', 'frcp.cluster_id'));
 
         // Join with persons
         $nameField = is_numeric($personName) ? 'frp.id' : 'frp.name';
-        $query->innerJoin('frf', 'facerecog_persons', 'frp', $query->expr()->andX(
-            $query->expr()->eq('frf.person', 'frp.id'),
-            $query->expr()->eq('frp.user', $query->createNamedParameter($personUid)),
+        $query->innerJoin('frcp', 'facerecog_persons', 'frp', $query->expr()->andX(
+            $query->expr()->eq('frcp.person_id', 'frp.id'),
+            $query->expr()->eq('frc.user', $query->createNamedParameter($personUid)),
             $query->expr()->eq($nameField, $query->createNamedParameter($personName)),
         ));
 
@@ -147,7 +154,7 @@ class FaceRecognitionBackend extends Backend
         // SELECT face detections
         $query->select(
             'frf.id as faceid',         // Face ID
-            'frp.id as cluster_id',     // Cluster ID
+            'frc.id as cluster_id',     // Cluster ID
             'fri.nc_file_id as file_id',      // Get actual file
             'frf.x',                    // Image cropping
             'frf.y',
@@ -161,17 +168,23 @@ class FaceRecognitionBackend extends Backend
 
         // WHERE faces are from images and current model.
         $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->andX(
-            $query->expr()->eq('fri.id', 'frf.image'),
+            $query->expr()->eq('fri.id', 'frf.image_id'),
             $query->expr()->eq('fri.model', $query->createNamedParameter($this->model())),
         ));
 
         // WHERE these photos are memories indexed
         $query->innerJoin('fri', 'memories', 'm', $query->expr()->eq('m.fileid', 'fri.nc_file_id'));
 
-        $query->innerJoin('frf', 'facerecog_persons', 'frp', $query->expr()->eq('frp.id', 'frf.person'));
+        // WHERE there are clusters with person
+        $query->innerJoin('frf', 'facerecog_person_clusters', 'frcp', $query->expr()->eq('frcp.cluster_id', 'frf.id'));
+
+        $query->innerJoin('frcp', 'facerecog_clusters', 'frc', $query->expr()->eq('frc.id', 'frcp.cluster_id'));
+
+        // WHERE there are clusters with person
+        $query->innerJoin('frcp', 'facerecog_persons', 'frp', $query->expr()->eq('frp.id', 'frcp.person_id'));
 
         // WHERE faces are from id persons (or a cluster).
-        $nameField = is_numeric($name) ? 'frp.id' : 'frp.name';
+        $nameField = is_numeric($name) ? 'frc.id' : 'frp.name';
         $query->where($query->expr()->eq($nameField, $query->createNamedParameter($name)));
 
         // WHERE these photos are in the user's requested folder recursively
@@ -179,7 +192,7 @@ class FaceRecognitionBackend extends Backend
 
         // LIMIT results
         if (-6 === $limit) {
-            Covers::filterCover($query, self::clusterType(), 'frf', 'id', 'person');
+            Covers::filterCover($query, self::clusterType(), 'frcp', 'cluster_id', 'person_id');
         } elseif (null !== $limit) {
             $query->setMaxResults($limit);
         }
@@ -260,7 +273,7 @@ class FaceRecognitionBackend extends Backend
         $query->innerJoin('frc', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.cluster_id', 'frc.id'));
 
         // WHERE there are faces with this cluster
-        $query->innerJoin('frc', 'facerecog_faces', 'frf', $query->expr()->eq('frc.id', 'frcf.face_id'));
+        $query->innerJoin('frc', 'facerecog_faces', 'frf', $query->expr()->eq('frf.id', 'frcf.face_id'));
 
         // WHERE faces are from images.
         $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image_id'));
@@ -337,7 +350,7 @@ class FaceRecognitionBackend extends Backend
         $query->innerJoin('frc', 'facerecog_cluster_faces', 'frcf', $query->expr()->eq('frcf.cluster_id', 'frc.id'));
 
         // WHERE there are faces with this cluster
-        $query->innerJoin('frc', 'facerecog_faces', 'frf', $query->expr()->eq('frc.id', 'frcf.face_id'));
+        $query->innerJoin('frc', 'facerecog_faces', 'frf', $query->expr()->eq('frf.id', 'frcf.face_id'));
 
         // WHERE faces are from images.
         $query->innerJoin('frf', 'facerecog_images', 'fri', $query->expr()->eq('fri.id', 'frf.image_id'));
